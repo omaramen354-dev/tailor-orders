@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+dist-ssr/
+*.local
+
+# toolchain / local build tools
+.toolchain/
+
+# capacitor / android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/capacitor-cordova-android-plugins/build/
+*.jks
+*.keystore
+
+# logs & editors
+npm-debug.log*
+yarn-error.log*
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
