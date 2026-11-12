@@ -1,4 +1,4 @@
-import { addD, fmtDate, sortOrders, today, type NotificationSettings, type Order, type Status } from "./orders";
+import { fmtDate, sortOrders, today, type NotificationSettings, type Order, type Status } from "./orders";
 
 export type AlertKind = "today" | "tomorrow" | "overdue";
 
@@ -42,7 +42,7 @@ export const buildAlertFeed = (
   settings: NotificationSettings,
   currentDay: string = today(),
 ): AlertItem[] => {
-  const tomorrowDay = currentDay === today() ? addD(1) : shiftDay(currentDay, 1);
+  const tomorrowDay = shiftDay(currentDay, 1);
 
   const list = sortOrders(orders)
     .filter((order) => order.status !== "تم التسليم")

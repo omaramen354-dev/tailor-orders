@@ -1,5 +1,13 @@
 # خياطة وأقمشة العمر — إدارة طلبات الخياطة
 
+## 📲 تثبيت التطبيق على الجوال بضغطة واحدة (APK)
+
+👉 **[اضغط هنا لتحميل وتثبيت التطبيق مباشرة (tailor-orders.apk)](https://github.com/omaramen354-dev/tailor-orders/releases/latest/download/tailor-orders.apk)**
+
+*(رابط بديل مباشر من المستودع: [تحميل tailor-orders.apk](https://github.com/omaramen354-dev/tailor-orders/raw/master/tailor-orders.apk))*
+
+---
+
 تطبيق محلي (بدون سيرفر) لإدارة طلبات الخياطة والقياسات، يعمل على جهاز واحد ويخزّن كل البيانات في `localStorage` داخل المتصفح/الهاتف.
 
 ## المزايا
