@@ -5,8 +5,11 @@ import {
   blank,
   fixOrder,
   fmtDate,
+  mergeImportedOrders,
   money,
+  normalizeDigits,
   sortOrders,
+  toLocalISODate,
   toNum,
   type Order,
 } from "./orders";
@@ -18,6 +21,14 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+describe("normalizeDigits", () => {
+  it("يحوّل الأرقام العربية الشرقية والفارسية والفاصلة العشرية العربية", () => {
+    expect(normalizeDigits("٠١٢٣٤٥٦٧٨٩")).toBe("0123456789");
+    expect(normalizeDigits("۰۱۲۳۴۵۶۷۸۹")).toBe("0123456789");
+    expect(normalizeDigits("١٥٠٫٥")).toBe("150.5");
+  });
+});
+
 describe("toNum", () => {
   it("يستخرج الرقم من نص فيه عملة أو فواصل", () => {
     expect(toNum("1,500 ل.س")).toBe(1500);
@@ -25,11 +36,18 @@ describe("toNum", () => {
     expect(toNum("السعر 300")).toBe(300);
   });
 
+  it("يدعم الأرقام المكتوبة بلوحة مفاتيح عربية والتنسيقات المتعددة النقاط", () => {
+    expect(toNum("١,٥٠٠ ل.س")).toBe(1500);
+    expect(toNum("٢٥٠٫٧٥")).toBe(250.75);
+    expect(toNum("12.3.4")).toBe(12.34);
+  });
+
   it("يرجع صفراً للقيم الفارغة أو غير الصالحة", () => {
     expect(toNum("")).toBe(0);
     expect(toNum(undefined)).toBe(0);
     expect(toNum(null)).toBe(0);
     expect(toNum("abc")).toBe(0);
+    expect(toNum(".")).toBe(0);
   });
 
   it("يتعامل مع الأرقام القادمة من نسخة احتياطية قديمة", () => {
@@ -37,7 +55,7 @@ describe("toNum", () => {
   });
 });
 
-describe("fmtDate", () => {
+describe("fmtDate & toLocalISODate", () => {
   it("يحوّل تاريخ ISO إلى صيغة يوم/شهر/سنة", () => {
     expect(fmtDate("2026-11-11")).toBe("11/11/2026");
   });
@@ -45,6 +63,11 @@ describe("fmtDate", () => {
   it("يتعامل مع القيم الفارغة أو غير المتوقعة", () => {
     expect(fmtDate("")).toBe("—");
     expect(fmtDate("غير معروف")).toBe("غير معروف");
+  });
+
+  it("ينسق التاريخ المحلي مع حشو الأصفار", () => {
+    const localDate = new Date(2026, 0, 5, 0, 30, 0);
+    expect(toLocalISODate(localDate)).toBe("2026-01-05");
   });
 });
 
@@ -57,7 +80,7 @@ describe("money", () => {
 });
 
 describe("fixOrder", () => {
-  it("يبني طلباً صالحاً من كائن فارغ", () => {
+  it("يبني طلباً صالحاً من كائن فارغ أو تالف (null / undefined)", () => {
     const order = fixOrder({});
     expect(order.id).toBeTruthy();
     expect(order.name).toBe("");
@@ -65,6 +88,10 @@ describe("fixOrder", () => {
     expect(order.status).toBe("جديد");
     expect(order.created).toBeTruthy();
     expect(order.updated).toBeTruthy();
+
+    const fromNull = fixOrder(null);
+    expect(fromNull.status).toBe("جديد");
+    expect(fromNull.m.thobe.len).toBe("");
   });
 
   it("يضمن وجود كل حقول القياسات", () => {
@@ -103,6 +130,31 @@ describe("fixOrder", () => {
   it("يتجاهل قوائم القياسات التالفة", () => {
     const order = fixOrder({ m: null as unknown as Order["m"] });
     expect(order.m.thobe.len).toBe("");
+  });
+});
+
+describe("mergeImportedOrders", () => {
+  it("يضيف الطلبات الجديدة ويحدّث الأقدم ويتجاهل التالف", () => {
+    const existing = [
+      makeOrder({ id: "1", name: "قديم", updated: "2026-05-01T00:00:00.000Z" }),
+      makeOrder({ id: "2", name: "أحدث محلياً", updated: "2026-09-01T00:00:00.000Z" }),
+    ];
+
+    const incoming = [
+      null,
+      "نص عشوائي",
+      { id: "1", name: "محدّث من النسخة", updated: "2026-08-01T00:00:00.000Z" },
+      { id: "2", name: "نسخة قديمة", updated: "2026-06-01T00:00:00.000Z" },
+      { id: "3", name: "عميل جديد", updated: "2026-10-01T00:00:00.000Z" },
+    ];
+
+    const result = mergeImportedOrders(existing, incoming);
+    expect(result.added).toBe(1);
+    expect(result.updated).toBe(1);
+    expect(result.orders).toHaveLength(3);
+    expect(result.orders.find((o) => o.id === "1")?.name).toBe("محدّث من النسخة");
+    expect(result.orders.find((o) => o.id === "2")?.name).toBe("أحدث محلياً");
+    expect(result.orders.find((o) => o.id === "3")?.name).toBe("عميل جديد");
   });
 });
 

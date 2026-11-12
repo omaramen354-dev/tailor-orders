@@ -106,20 +106,42 @@ export const SECS: MS[] = [
 
 /* ══════════════════════ HELPERS ══════════════════════ */
 export const nowISO = () => new Date().toISOString();
-export const today = () => nowISO().slice(0, 10);
+
+/** يحوّل كائن التاريخ إلى YYYY-MM-DD حسب التوقيت المحلي للجهاز بدقة. */
+export const toLocalISODate = (date: Date = new Date()): string => {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+};
+
+export const today = () => toLocalISODate(new Date());
+
 export const addD = (d: number) => {
   const x = new Date();
   x.setDate(x.getDate() + d);
-  return x.toISOString().slice(0, 10);
+  return toLocalISODate(x);
 };
+
 export const uid = () =>
   typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID()
     : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-/** يحوّل أي قيمة قادمة من نموذج أو ملف نسخة احتياطية إلى رقم آمن. */
+/** يوحّد الأرقام العربية/الفارسية (٠-٩ / ۰-۹) والفاصلة العشرية العربية إلى أرقام قياسية. */
+export const normalizeDigits = (input: string): string =>
+  input
+    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06f0))
+    .replace(/\u066B/g, ".");
+
+/** يحوّل أي قيمة قادمة من نموذج أو لوحة مفاتيح عربية أو ملف نسخة احتياطية إلى رقم آمن. */
 export const toNum = (v: unknown) => {
-  const r = Number(String(v ?? "").replace(/[^\d.]/g, ""));
+  const cleaned = normalizeDigits(String(v ?? "")).replace(/[^\d.]/g, "");
+  if (!cleaned) return 0;
+  const [intPart, ...rest] = cleaned.split(".");
+  const normalized = rest.length > 0 ? `${intPart}.${rest.join("")}` : intPart;
+  const r = Number(normalized);
   return Number.isFinite(r) ? r : 0;
 };
 
@@ -163,13 +185,16 @@ export const blank = (): Order => ({
   updated: nowISO(),
 });
 
-/** يرمّم أي طلب (من التخزين المحلي أو نسخة احتياطية) إلى شكل صالح دائماً. */
-export const fixOrder = (r: Partial<Order>): Order => {
+/** يرمّم أي طلب (من التخزين المحلي أو نسخة احتياطية) إلى شكل صالح دائماً حتى لو كان تالفاً. */
+export const fixOrder = (r: Partial<Order> | null | undefined): Order => {
+  const safe: Partial<Order> = r && typeof r === "object" && !Array.isArray(r) ? r : {};
   const b = blank();
+  const rawMeas = safe.m && typeof safe.m === "object" && !Array.isArray(safe.m) ? safe.m : undefined;
   const ms = SECS.reduce<Meas>((a, s) => {
-    const raw = r.m?.[s.key];
+    const rawSec = rawMeas?.[s.key];
+    const secObj = rawSec && typeof rawSec === "object" && !Array.isArray(rawSec) ? rawSec : undefined;
     a[s.key] = s.fields.reduce<Record<string, string>>((acc, f) => {
-      acc[f.id] = asText(raw?.[f.id]);
+      acc[f.id] = asText(secObj?.[f.id]);
       return acc;
     }, {});
     return a;
@@ -177,25 +202,61 @@ export const fixOrder = (r: Partial<Order>): Order => {
 
   return {
     ...b,
-    ...r,
-    id: asText(r.id) || b.id,
-    name: asText(r.name),
-    phone: asText(r.phone),
-    total: asText(r.total),
-    paid: asText(r.paid),
-    date: asText(r.date) || b.date,
-    delivery: asText(r.delivery) || b.delivery,
-    fabric: asText(r.fabric),
-    pieces: asText(r.pieces, "1") || "1",
-    status: ALL.includes(r.status as Status) ? (r.status as Status) : "جديد",
-    notes: asText(r.notes),
+    ...safe,
+    id: asText(safe.id) || b.id,
+    name: asText(safe.name),
+    phone: asText(safe.phone),
+    total: asText(safe.total),
+    paid: asText(safe.paid),
+    date: asText(safe.date) || b.date,
+    delivery: asText(safe.delivery) || b.delivery,
+    fabric: asText(safe.fabric),
+    pieces: asText(safe.pieces, "1") || "1",
+    status: ALL.includes(safe.status as Status) ? (safe.status as Status) : "جديد",
+    notes: asText(safe.notes),
     m: ms,
-    created: asText(r.created) || b.created,
-    updated: asText(r.updated) || b.updated,
+    created: asText(safe.created) || b.created,
+    updated: asText(safe.updated) || b.updated,
   };
 };
 
 export const sortOrders = (l: Order[]) => [...l].sort((a, b) => b.updated.localeCompare(a.updated));
+
+export interface MergeOrdersResult {
+  orders: Order[];
+  added: number;
+  updated: number;
+}
+
+/** يدمج طلبات النسخة الاحتياطية مع الحالية مع تحديث الطلبات الأحدث وتجاهل العناصر التالفة. */
+export const mergeImportedOrders = (existing: Order[], rawItems: unknown[]): MergeOrdersResult => {
+  const byId = new Map<string, Order>();
+  for (const o of existing) {
+    byId.set(o.id, o);
+  }
+
+  let added = 0;
+  let updated = 0;
+
+  for (const item of rawItems) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const incoming = fixOrder(item as Partial<Order>);
+    const current = byId.get(incoming.id);
+    if (!current) {
+      byId.set(incoming.id, incoming);
+      added += 1;
+    } else if (incoming.updated > current.updated) {
+      byId.set(incoming.id, incoming);
+      updated += 1;
+    }
+  }
+
+  return {
+    orders: sortOrders(Array.from(byId.values())),
+    added,
+    updated,
+  };
+};
 
 export const sColor = (s: Status): string =>
   ({

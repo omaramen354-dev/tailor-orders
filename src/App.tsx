@@ -10,7 +10,9 @@ import {
   blank,
   fixOrder,
   fmtDate,
+  mergeImportedOrders,
   money,
+  normalizeDigits,
   nowISO,
   sColor,
   sDot,
@@ -32,19 +34,33 @@ import {
   planReminderNotifications,
   type AlertItem,
 } from "./lib/notifications";
+import {
+  getSystemNotificationPermission,
+  isAndroidApp,
+  printOrderCard,
+  requestSystemNotificationPermission,
+  saveBackupData,
+  shareOrderSummary,
+  showSystemNotification,
+  supportsSystemNotifications,
+} from "./lib/nativeBridge";
 
 /* ══════════════════════ MAIN APP ══════════════════════ */
 export default function App() {
-  const supportsNotifications = typeof window !== "undefined" && "Notification" in window;
-
   /* ── state ── */
   const [pg, setPg] = useState<Page>("home");
   const [orders, setOrders] = useState<Order[]>(() => {
     try {
       const s = localStorage.getItem(DB);
       if (!s) return [];
-      const p = JSON.parse(s);
-      return Array.isArray(p) ? sortOrders(p.map((x: Partial<Order>) => fixOrder(x))) : [];
+      const p: unknown = JSON.parse(s);
+      return Array.isArray(p)
+        ? sortOrders(
+            p
+              .filter((x): x is Partial<Order> => Boolean(x && typeof x === "object" && !Array.isArray(x)))
+              .map((x) => fixOrder(x)),
+          )
+        : [];
     } catch {
       return [];
     }
@@ -54,10 +70,11 @@ export default function App() {
   const [fStatus, setFS] = useState("الكل");
   const [toast, setToast] = useState("");
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Order | null>(null);
   const [installPrompt, setIP] = useState<BeforeInstallPromptEvent | null>(null);
-  const [isOnline, setOnline] = useState(navigator.onLine);
-  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>(
-    supportsNotifications ? Notification.permission : "denied",
+  const [isOnline, setOnline] = useState(() => (typeof navigator !== "undefined" ? navigator.onLine : true));
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>(() =>
+    getSystemNotificationPermission(),
   );
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() => {
     try {
@@ -104,8 +121,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (isAndroidApp() || window.location.protocol === "file:") return;
     if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => {});
+      navigator.serviceWorker.register("./sw.js").catch(() => {});
     }
   }, []);
 
@@ -131,8 +149,8 @@ export default function App() {
 
   useEffect(() => {
     const syncPermission = () => {
-      if (supportsNotifications) {
-        setNotificationPermission(Notification.permission);
+      if (supportsSystemNotifications()) {
+        setNotificationPermission(getSystemNotificationPermission());
       }
     };
 
@@ -149,7 +167,7 @@ export default function App() {
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("focus", syncPermission);
     };
-  }, [supportsNotifications]);
+  }, []);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -161,15 +179,59 @@ export default function App() {
     if (orderId) setExpanded(orderId);
   }, []);
 
+  useEffect(() => {
+    window.__onNativeToast = (message: string) => {
+      if (message) setToast(message);
+    };
+    window.__openOrderFromNotification = (orderId: string) => {
+      setFS("الكل");
+      if (orderId) {
+        setExpanded(orderId);
+        setPg("archive");
+      } else {
+        setPg("home");
+      }
+    };
+    return () => {
+      delete window.__onNativeToast;
+      delete window.__openOrderFromNotification;
+    };
+  }, []);
+
+  useEffect(() => {
+    window.__handleAndroidBack = () => {
+      if (deleteTarget) {
+        setDeleteTarget(null);
+        return true;
+      }
+      if (pg === "preview") {
+        setPg("form");
+        return true;
+      }
+      if (pg === "form" || pg === "archive") {
+        setPg("home");
+        return true;
+      }
+      return false;
+    };
+    return () => {
+      delete window.__handleAndroidBack;
+    };
+  }, [deleteTarget, pg]);
+
   /* ── computed ── */
   const bal = useMemo(() => toNum(form.total) - toNum(form.paid), [form.total, form.paid]);
 
   const filtered = useMemo(() => {
     let list = sortOrders(orders);
     if (fStatus !== "الكل") list = list.filter((o) => o.status === fStatus);
-    const query = q.trim().toLowerCase();
+    const query = normalizeDigits(q.trim()).toLowerCase();
     if (query) {
-      list = list.filter((o) => [o.name, o.phone, o.fabric, o.notes, o.status].join(" ").toLowerCase().includes(query));
+      list = list.filter((o) =>
+        normalizeDigits([o.name, o.phone, o.fabric, o.notes, o.status].join(" "))
+          .toLowerCase()
+          .includes(query),
+      );
     }
     return list;
   }, [orders, q, fStatus]);
@@ -182,7 +244,7 @@ export default function App() {
       inProg: orders.filter((o) => o.status === "قيد التنفيذ").length,
       done: orders.filter((o) => o.status === "تم التسليم").length,
       newO: orders.filter((o) => o.status === "جديد").length,
-      todayDel: orders.filter((o) => o.delivery === dayKey).length,
+      todayDel: orders.filter((o) => o.delivery === dayKey && o.status !== "تم التسليم").length,
     }),
     [orders, dayKey],
   );
@@ -203,7 +265,7 @@ export default function App() {
   const setM = useCallback((sec: string, fid: string, v: string) => {
     setForm((f) => ({
       ...f,
-      m: { ...f.m, [sec]: { ...f.m[sec], [fid]: v } },
+      m: { ...f.m, [sec]: { ...f.m[sec], [fid]: normalizeDigits(v) } },
       updated: nowISO(),
     }));
   }, []);
@@ -221,36 +283,12 @@ export default function App() {
 
   const showLocalNotification = useCallback(
     async (title: string, body: string, tag: string, orderId?: string) => {
-      if (!supportsNotifications || Notification.permission !== "granted") {
+      if (!supportsSystemNotifications()) {
         return false;
       }
-
-      const options: NotificationOptions = {
-        body,
-        icon: "/icon-512.png",
-        badge: "/icon-512.png",
-        tag,
-        data: {
-          url: orderId ? `/?page=archive&orderId=${orderId}` : "/?page=home",
-          orderId,
-        },
-      };
-
-      try {
-        const registration =
-          "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration() : undefined;
-
-        if (registration) {
-          await registration.showNotification(title, options);
-        } else {
-          new Notification(title, options);
-        }
-        return true;
-      } catch {
-        return false;
-      }
+      return showSystemNotification(title, body, tag, orderId);
     },
-    [supportsNotifications],
+    [],
   );
 
   const checkAndSendReminders = useCallback(async () => {
@@ -293,20 +331,20 @@ export default function App() {
   }, [checkAndSendReminders]);
 
   const requestNotificationPermission = async (): Promise<NotificationPermission> => {
-    if (!supportsNotifications) {
+    if (!supportsSystemNotifications()) {
       msg("❌ الإشعارات غير مدعومة على هذا الجهاز");
       return "denied";
     }
 
     try {
-      const permission = await Notification.requestPermission();
+      const permission = await requestSystemNotificationPermission();
       setNotificationPermission(permission);
 
       if (permission === "granted") {
         setNotificationSettings((prev) => ({ ...prev, enabled: true }));
         msg("🔔 تم تفعيل الإشعارات");
       } else if (permission === "denied") {
-        msg("❌ تم رفض الإشعارات من المتصفح");
+        msg("❌ تم رفض الإشعارات من الجهاز");
       } else {
         msg("ℹ️ لم يتم تفعيل الإشعارات بعد");
       }
@@ -319,7 +357,7 @@ export default function App() {
   };
 
   const toggleNotificationSystem = async () => {
-    if (!supportsNotifications) {
+    if (!supportsSystemNotifications()) {
       msg("❌ الإشعارات غير مدعومة");
       return;
     }
@@ -334,7 +372,7 @@ export default function App() {
   };
 
   const sendTestNotification = async () => {
-    if (!supportsNotifications) {
+    if (!supportsSystemNotifications()) {
       msg("❌ الإشعارات غير مدعومة");
       return;
     }
@@ -369,7 +407,7 @@ export default function App() {
       return;
     }
 
-    const o = { ...form, updated: nowISO() };
+    const o = { ...form, name: form.name.trim(), updated: nowISO() };
     setOrders((prev) => {
       const exists = prev.some((x) => x.id === o.id);
       return sortOrders(exists ? prev.map((x) => (x.id === o.id ? o : x)) : [o, ...prev]);
@@ -385,11 +423,19 @@ export default function App() {
     msg("📋 تم فتح الطلب");
   };
 
-  const del = (id: string) => {
+  const requestDelete = (id: string) => {
     const o = orders.find((x) => x.id === id);
-    if (!o || !confirm(`حذف طلب ${o.name}؟`)) return;
+    if (!o) return;
+    setDeleteTarget(o);
+  };
+
+  const confirmDelete = () => {
+    if (!deleteTarget) return;
+    const id = deleteTarget.id;
     setOrders((prev) => prev.filter((x) => x.id !== id));
     if (form.id === id) setForm(blank());
+    if (expanded === id) setExpanded(null);
+    setDeleteTarget(null);
     msg("🗑️ تم الحذف");
   };
 
@@ -418,32 +464,25 @@ export default function App() {
       `📦 الاستلام: ${fmtDate(form.delivery)}`,
     ].join("\n");
 
-    try {
-      const nav = typeof navigator !== "undefined" ? navigator : undefined;
-      if (nav && typeof nav.share === "function") {
-        await nav.share({ title: STORE.name, text: txt });
-        return;
-      }
-      if (nav?.clipboard?.writeText) {
-        await nav.clipboard.writeText(txt);
-        msg("📋 تم النسخ");
-        return;
-      }
+    const result = await shareOrderSummary(STORE.name, txt);
+    if (result === "copied") {
+      msg("📋 تم النسخ");
+    } else if (result === "failed") {
       msg("المشاركة غير متاحة");
-    } catch {
-      msg("تعذرت المشاركة");
     }
   };
 
   const exportBackup = () => {
-    const blob = new Blob([JSON.stringify(orders, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `خياطة-العمر-${today()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    msg("📥 تم تحميل النسخة الاحتياطية");
+    const filename = `خياطة-العمر-${today()}.json`;
+    const jsonContent = JSON.stringify(orders, null, 2);
+    const mode = saveBackupData(filename, jsonContent);
+    if (mode === "browser") {
+      msg("📥 تم تحميل النسخة الاحتياطية");
+    } else if (mode === "native") {
+      msg("📂 اختر مكان حفظ النسخة الاحتياطية");
+    } else {
+      msg("❌ تعذر حفظ النسخة الاحتياطية");
+    }
   };
 
   const importBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -453,17 +492,22 @@ export default function App() {
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        const data = JSON.parse(ev.target?.result as string);
+        const data: unknown = JSON.parse(ev.target?.result as string);
         if (!Array.isArray(data)) {
           msg("❌ ملف غير صالح");
           return;
         }
-        const imported = data.map((x: Partial<Order>) => fixOrder(x));
-        setOrders((prev) => {
-          const ids = new Set(prev.map((o) => o.id));
-          return sortOrders([...prev, ...imported.filter((o: Order) => !ids.has(o.id))]);
-        });
-        msg(`✅ تم استيراد ${imported.length} طلب`);
+        const { orders: merged, added, updated } = mergeImportedOrders(orders, data);
+        setOrders(merged);
+        if (added > 0 && updated > 0) {
+          msg(`✅ تم استيراد ${added} طلب وتحديث ${updated}`);
+        } else if (added > 0) {
+          msg(`✅ تم استيراد ${added} طلب`);
+        } else if (updated > 0) {
+          msg(`✅ تم تحديث ${updated} طلب`);
+        } else {
+          msg("ℹ️ كل الطلبات موجودة ومحدثة مسبقاً");
+        }
       } catch {
         msg("❌ خطأ في قراءة الملف");
       }
@@ -479,13 +523,50 @@ export default function App() {
     msg("🎉 جاري التثبيت");
   };
 
+  const handlePrint = () => {
+    const title = form.name ? `بطاقة-${form.name}` : STORE.name;
+    if (!printOrderCard(title)) {
+      msg("❌ الطباعة غير متاحة");
+    }
+  };
+
   /* ══════════════════════ RENDER ══════════════════════ */
   return (
     <div dir="rtl" className="min-h-screen bg-slate-50 pb-24 text-slate-900 select-none">
       {toast ? (
-        <div className="no-print fixed left-3 right-3 top-3 z-[99] mx-auto max-w-sm">
+        <div role="status" className="no-print fixed left-3 right-3 top-3 z-[99] mx-auto max-w-sm">
           <div className="anim-toast rounded-2xl bg-slate-900 px-5 py-3.5 text-center text-sm font-semibold text-white shadow-2xl">
             {toast}
+          </div>
+        </div>
+      ) : null}
+
+      {deleteTarget ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="تأكيد حذف الطلب"
+          className="no-print fixed inset-0 z-[95] flex items-center justify-center bg-slate-900/50 px-4"
+        >
+          <div className="anim-toast w-full max-w-xs rounded-2xl bg-white p-5 text-right shadow-2xl">
+            <p className="text-base font-extrabold text-slate-900">🗑️ حذف الطلب</p>
+            <p className="mt-2 text-xs leading-6 text-slate-600">
+              هل أنت متأكد من حذف طلب <span className="font-extrabold text-slate-900">{deleteTarget.name || "بدون اسم"}</span>؟ لا يمكن التراجع عن هذا الإجراء.
+            </p>
+            <div className="mt-4 grid grid-cols-2 gap-2.5">
+              <button
+                onClick={confirmDelete}
+                className="rounded-xl bg-red-600 py-2.5 text-xs font-extrabold text-white transition hover:bg-red-700"
+              >
+                تأكيد الحذف
+              </button>
+              <button
+                onClick={() => setDeleteTarget(null)}
+                className="rounded-xl border border-slate-200 bg-white py-2.5 text-xs font-bold text-slate-700 transition hover:bg-slate-50"
+              >
+                إلغاء
+              </button>
+            </div>
           </div>
         </div>
       ) : null}
@@ -501,8 +582,10 @@ export default function App() {
             <div className="relative mx-auto max-w-xl">
               <div className="mb-6 flex items-center justify-between">
                 <div className="flex items-center gap-1.5">
-                  <span className={`h-2 w-2 rounded-full ${isOnline ? "bg-emerald-400" : "bg-red-400"}`} />
-                  <span className="text-[11px] text-slate-400">{isOnline ? "متصل بالإنترنت" : "بدون إنترنت"}</span>
+                  <span className={`h-2 w-2 rounded-full ${isOnline ? "bg-emerald-400" : "bg-amber-400"}`} />
+                  <span className="text-[11px] text-slate-400">
+                    {isOnline ? "جاهز · حفظ محلي" : "يعمل بدون إنترنت ✓"}
+                  </span>
                 </div>
                 {installPrompt ? (
                   <button onClick={installApp} className="rounded-xl bg-emerald-500 px-3 py-1.5 text-[11px] font-bold text-white">
@@ -641,7 +724,7 @@ export default function App() {
               </div>
 
               <p className="mt-3 text-[10px] leading-5 text-slate-400">
-                ملاحظة: هذه التنبيهات محلية داخل التطبيق. للتنبيهات الخلفية الكاملة حتى عند إغلاق التطبيق نهائياً نحتاج ربط لاحق بخدمة Push خارجية.
+                ملاحظة: جميع البيانات والتنبيهات محفوظة محلياً على جهازك دون الحاجة للإنترنت.
               </p>
             </div>
 
@@ -707,14 +790,24 @@ export default function App() {
       {pg === "form" ? (
         <div className="anim-fade">
           <div className="bg-slate-900 px-5 pb-5 pt-10">
-            <div className="mx-auto flex max-w-xl items-center gap-3">
-              <button onClick={() => setPg("home")} className="text-lg text-slate-400 transition hover:text-white">
-                ←
-              </button>
-              <div>
-                <h2 className="text-lg font-extrabold text-white">{form.name ? `تعديل · ${form.name}` : "طلب جديد"}</h2>
-                <p className="mt-0.5 text-xs text-slate-400">أدخل بيانات العميل والقياسات</p>
+            <div className="mx-auto flex max-w-xl items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                <button aria-label="رجوع" onClick={() => setPg("home")} className="text-lg text-slate-400 transition hover:text-white">
+                  ←
+                </button>
+                <div>
+                  <h2 className="text-lg font-extrabold text-white">
+                    {orders.some((o) => o.id === form.id) && form.name ? `تعديل · ${form.name}` : "طلب جديد"}
+                  </h2>
+                  <p className="mt-0.5 text-xs text-slate-400">أدخل بيانات العميل والقياسات</p>
+                </div>
               </div>
+              <button
+                onClick={newOrder}
+                className="rounded-xl bg-white/10 px-3.5 py-2 text-xs font-bold text-white transition hover:bg-white/20"
+              >
+                + طلب جديد
+              </button>
             </div>
           </div>
 
@@ -723,14 +816,14 @@ export default function App() {
               <div className="space-y-3">
                 <Inp label="الاسم" v={form.name} set={(v) => setF("name", v)} ph="اسم العميل الكامل" />
                 <div className="grid grid-cols-2 gap-3">
-                  <Inp label="رقم الهاتف" v={form.phone} set={(v) => setF("phone", v)} ph="09xxxxxxxx" type="tel" />
+                  <Inp label="رقم الهاتف" v={form.phone} set={(v) => setF("phone", normalizeDigits(v))} ph="09xxxxxxxx" type="tel" />
                   <Inp label="نوع القماش" v={form.fabric} set={(v) => setF("fabric", v)} ph="صوف / كتان" />
                 </div>
                 <div className="grid grid-cols-2 gap-3">
                   <Inp label="تاريخ الطلب" v={form.date} set={(v) => setF("date", v)} type="date" />
                   <Inp label="تاريخ الاستلام" v={form.delivery} set={(v) => setF("delivery", v)} type="date" />
                 </div>
-                <Inp label="عدد القطع" v={form.pieces} set={(v) => setF("pieces", v)} type="number" ph="1" />
+                <Inp label="عدد القطع" v={form.pieces} set={(v) => setF("pieces", normalizeDigits(v))} inputMode="numeric" ph="1" />
                 <div>
                   <p className="mb-2 text-xs font-bold text-slate-600">حالة الطلب</p>
                   <div className="grid grid-cols-2 gap-2">
@@ -754,8 +847,8 @@ export default function App() {
 
             <Card title="💰 الحساب المالي">
               <div className="mb-3 grid grid-cols-2 gap-3">
-                <Inp label="القيمة الكلية" v={form.total} set={(v) => setF("total", v)} type="number" ph="0" />
-                <Inp label="المبلغ المدفوع" v={form.paid} set={(v) => setF("paid", v)} type="number" ph="0" />
+                <Inp label="القيمة الكلية" v={form.total} set={(v) => setF("total", normalizeDigits(v))} inputMode="decimal" ph="0" />
+                <Inp label="المبلغ المدفوع" v={form.paid} set={(v) => setF("paid", normalizeDigits(v))} inputMode="decimal" ph="0" />
               </div>
               <div className={`rounded-2xl border p-4 text-center ${bal > 0 ? "border-red-100 bg-red-50" : bal < 0 ? "border-amber-100 bg-amber-50" : "border-emerald-100 bg-emerald-50"}`}>
                 <p className="text-xs font-semibold text-slate-500">المبلغ المتبقي</p>
@@ -766,23 +859,28 @@ export default function App() {
             {SECS.map((sec) => (
               <Card key={sec.key} title={`${sec.icon} ${sec.title}`}>
                 <div className="grid grid-cols-3 gap-x-2.5 gap-y-3">
-                  {sec.fields.map((f) => (
-                    <div key={f.id}>
-                      <label className="mb-1 block text-[11px] font-bold text-slate-500">{f.label}</label>
-                      <input
-                        value={form.m[sec.key]?.[f.id] ?? ""}
-                        onChange={(e) => setM(sec.key, f.id, e.target.value)}
-                        placeholder={f.ph}
-                        className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition placeholder:text-slate-300 focus:border-sky-400 focus:ring-2 focus:ring-sky-100"
-                      />
-                    </div>
-                  ))}
+                  {sec.fields.map((f) => {
+                    const fieldId = `meas-${sec.key}-${f.id}`;
+                    return (
+                      <div key={f.id}>
+                        <label htmlFor={fieldId} className="mb-1 block text-[11px] font-bold text-slate-500">{f.label}</label>
+                        <input
+                          id={fieldId}
+                          value={form.m[sec.key]?.[f.id] ?? ""}
+                          onChange={(e) => setM(sec.key, f.id, e.target.value)}
+                          placeholder={f.ph}
+                          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm outline-none transition placeholder:text-slate-300 focus:border-sky-400 focus:ring-2 focus:ring-sky-100"
+                        />
+                      </div>
+                    );
+                  })}
                 </div>
               </Card>
             ))}
 
             <Card title="📝 ملاحظات">
               <textarea
+                aria-label="ملاحظات"
                 value={form.notes}
                 onChange={(e) => setF("notes", e.target.value)}
                 placeholder="أي تعليمات خاصة بالتفصيل..."
@@ -814,7 +912,7 @@ export default function App() {
           <div className="bg-slate-900 px-5 pb-5 pt-10">
             <div className="mx-auto flex max-w-xl items-center justify-between">
               <div className="flex items-center gap-3">
-                <button onClick={() => setPg("home")} className="text-lg text-slate-400 transition hover:text-white">
+                <button aria-label="رجوع" onClick={() => setPg("home")} className="text-lg text-slate-400 transition hover:text-white">
                   ←
                 </button>
                 <div>
@@ -832,6 +930,7 @@ export default function App() {
             <div className="relative">
               <span className="pointer-events-none absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400">🔍</span>
               <input
+                aria-label="بحث في الطلبات"
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
                 placeholder="ابحث بالاسم، الهاتف، القماش..."
@@ -933,7 +1032,7 @@ export default function App() {
                           <button onClick={() => { setForm(fixOrder(o)); setPg("preview"); }} className="flex-1 rounded-xl border border-slate-200 bg-white py-2.5 text-xs font-bold transition hover:bg-slate-50">
                             👁️ معاينة
                           </button>
-                          <button onClick={() => del(o.id)} className="rounded-xl border border-red-200 bg-white px-4 py-2.5 text-xs font-bold text-red-500 transition hover:bg-red-50">
+                          <button aria-label={`حذف طلب ${o.name}`} onClick={() => requestDelete(o.id)} className="rounded-xl border border-red-200 bg-white px-4 py-2.5 text-xs font-bold text-red-500 transition hover:bg-red-50">
                             🗑️
                           </button>
                         </div>
@@ -954,7 +1053,7 @@ export default function App() {
                   📤 استيراد نسخة
                 </button>
               </div>
-              <input ref={importRef} type="file" accept=".json" onChange={importBackup} className="hidden" />
+              <input data-testid="backup-file-input" ref={importRef} type="file" accept=".json,application/json" onChange={importBackup} className="hidden" />
             </div>
           </div>
         </div>
@@ -965,7 +1064,7 @@ export default function App() {
         <div className="anim-fade">
           <div className="no-print bg-slate-900 px-5 pb-5 pt-10">
             <div className="mx-auto flex max-w-xl items-center gap-3">
-              <button onClick={() => setPg("form")} className="text-lg text-slate-400 transition hover:text-white">
+              <button aria-label="رجوع" onClick={() => setPg("form")} className="text-lg text-slate-400 transition hover:text-white">
                 ←
               </button>
               <h2 className="text-lg font-extrabold text-white">معاينة البطاقة</h2>
@@ -974,7 +1073,7 @@ export default function App() {
 
           <div className="mx-auto max-w-xl space-y-3 px-4 pt-4">
             <div className="no-print grid grid-cols-2 gap-2.5">
-              <button onClick={() => { setTimeout(() => window.print(), 100); }} className="rounded-2xl bg-slate-900 py-3 text-sm font-bold text-white transition hover:bg-slate-800">
+              <button onClick={handlePrint} className="rounded-2xl bg-slate-900 py-3 text-sm font-bold text-white transition hover:bg-slate-800">
                 🖨️ طباعة
               </button>
               <button onClick={share} className="rounded-2xl border border-slate-200 bg-white py-3 text-sm font-bold transition hover:bg-slate-50">
@@ -1059,7 +1158,7 @@ export default function App() {
           ]).map((t) => (
             <button
               key={t.k}
-              onClick={() => (t.k === "form" ? newOrder() : setPg(t.k))}
+              onClick={() => setPg(t.k)}
               className={`py-3 text-center transition active:scale-95 ${pg === t.k ? "text-slate-900" : "text-slate-400 hover:text-slate-600"}`}
             >
               <span className="block text-xl">{t.ic}</span>
@@ -1084,12 +1183,29 @@ function Card({ title, children }: { title: string; children: React.ReactNode })
   );
 }
 
-function Inp({ label, v, set, ph, type = "text" }: { label: string; v: string; set: (v: string) => void; ph?: string; type?: string }) {
+function Inp({
+  label,
+  v,
+  set,
+  ph,
+  type = "text",
+  inputMode,
+}: {
+  label: string;
+  v: string;
+  set: (v: string) => void;
+  ph?: string;
+  type?: string;
+  inputMode?: React.HTMLAttributes<HTMLInputElement>["inputMode"];
+}) {
+  const inputId = `inp-${label.replace(/\s+/g, "-")}`;
   return (
     <div>
-      <label className="mb-1.5 block text-xs font-bold text-slate-600">{label}</label>
+      <label htmlFor={inputId} className="mb-1.5 block text-xs font-bold text-slate-600">{label}</label>
       <input
+        id={inputId}
         type={type}
+        inputMode={inputMode}
         value={v}
         onChange={(e) => set(e.target.value)}
         placeholder={ph}
